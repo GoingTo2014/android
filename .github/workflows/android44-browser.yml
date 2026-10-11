@@ -13,6 +13,9 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Start Android 4.4 and browser tunnel
         shell: bash
         env:
@@ -24,8 +27,7 @@ jobs:
           echo "STEP 1: Checking configuration..."
 
           if [ -z "${VNC_PASSWORD:-}" ] || [ "${#VNC_PASSWORD}" -ne 8 ]; then
-            echo "ERROR: Set VNC_PASSWORD in repository Actions secrets."
-            echo "The password must be exactly 8 characters."
+            echo "ERROR: Set repository secret VNC_PASSWORD to exactly 8 characters."
             exit 1
           fi
 
@@ -41,7 +43,7 @@ jobs:
             libxcursor1 libxcomposite1 libxdamage1 libxfixes3 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xinerama0
 
-          echo "STEP 3: Starting virtual display..."
+          echo "STEP 3: Starting virtual desktop..."
 
           export DISPLAY=:0
 
@@ -54,7 +56,7 @@ jobs:
 
           if ! kill -0 "$XVFB_PID" 2>/dev/null; then
             cat /tmp/xvfb.log
-            echo "ERROR: Xvfb failed."
+            echo "ERROR: Virtual display failed to start."
             exit 1
           fi
 
@@ -69,18 +71,19 @@ jobs:
             -rfbauth /tmp/vnc.pass \
             -wait 10 -defer 10 \
             >/tmp/x11vnc.log 2>&1 &
+          VNC_PID=$!
 
           websockify --web=/usr/share/novnc \
             127.0.0.1:6080 127.0.0.1:5900 \
             >/tmp/novnc.log 2>&1 &
+          WEBSOCKIFY_PID=$!
 
-          echo "STEP 4: Checking the browser desktop..."
+          echo "Checking noVNC..."
 
           HTTP_READY=0
 
           for i in $(seq 1 30); do
-            if curl -fsS \
-              http://127.0.0.1:6080/vnc.html \
+            if curl -fsS http://127.0.0.1:6080/vnc.html \
               >/dev/null; then
               HTTP_READY=1
               break
@@ -89,13 +92,13 @@ jobs:
           done
 
           if [ "$HTTP_READY" -ne 1 ]; then
-            echo "ERROR: noVNC is not responding."
+            echo "ERROR: noVNC did not start."
             cat /tmp/novnc.log
             cat /tmp/x11vnc.log
             exit 1
           fi
 
-          echo "STEP 5: Installing Cloudflare Tunnel..."
+          echo "STEP 4: Installing Cloudflare Tunnel..."
 
           curl -fL --retry 3 \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
@@ -103,18 +106,22 @@ jobs:
 
           sudo dpkg -i /tmp/cloudflared.deb
 
-          echo "STEP 6: Creating your public browser link..."
-          echo "Cloudflare startup messages will appear below."
+          echo "STEP 5: Creating browser link..."
+          echo "Waiting for Cloudflare to generate a URL..."
 
           : > /tmp/cloudflared.log
 
           cloudflared tunnel \
             --url http://127.0.0.1:6080 \
             --no-autoupdate \
-            --output json \
-            2>&1 | tee /tmp/cloudflared.log &
-
+            --loglevel info \
+            >/tmp/cloudflared.log 2>&1 &
           TUNNEL_PID=$!
+
+          # Show Cloudflare output in the live Actions logs.
+          tail -n +1 -F /tmp/cloudflared.log &
+          LOG_TAIL_PID=$!
+
           URL=""
 
           for i in $(seq 1 90); do
@@ -136,8 +143,8 @@ jobs:
           done
 
           if [ -z "$URL" ]; then
-            echo "ERROR: No Cloudflare URL was detected."
-            echo "Full Cloudflare output follows:"
+            echo "ERROR: Cloudflare URL was not detected."
+            echo "Cloudflare output:"
             cat /tmp/cloudflared.log
             exit 1
           fi
@@ -145,15 +152,15 @@ jobs:
           BROWSER_URL="${URL}/vnc.html?autoconnect=true&resize=scale&quality=5&compression=1"
 
           echo ""
-          echo "****************************************"
+          echo "================================================"
           echo "YOUR ANDROID 4.4 BROWSER LINK:"
           echo "$BROWSER_URL"
-          echo "****************************************"
+          echo "================================================"
           echo ""
 
           echo "::notice title=Android 4.4 Browser Link::$BROWSER_URL"
 
-          echo "STEP 7: Preparing Android SDK..."
+          echo "STEP 6: Preparing Android SDK..."
 
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
@@ -180,7 +187,7 @@ jobs:
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
             --licenses >/dev/null 2>&1 || true
 
-          echo "Installing Android 4.4 x86 system image..."
+          echo "Installing Android 4.4 system image..."
 
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
             "emulator" \
@@ -206,6 +213,7 @@ jobs:
             fi
           }
 
+          # Reduce display and rendering overhead.
           set_avd_property hw.lcd.width 360
           set_avd_property hw.lcd.height 640
           set_avd_property hw.lcd.density 160
@@ -214,7 +222,7 @@ jobs:
           set_avd_property vm.heapSize 128
           set_avd_property hw.keyboard yes
 
-          echo "STEP 8: Checking hardware acceleration..."
+          echo "STEP 7: Checking hardware acceleration..."
 
           if [ -e /dev/kvm ]; then
             sudo chmod a+rw /dev/kvm 2>/dev/null || true
@@ -225,12 +233,13 @@ jobs:
             echo "KVM is available."
           else
             ACCEL=off
-            echo "WARNING: KVM is unavailable; emulation will be slower."
+            export ANDROID_I_WANT_MY_TCG=yes
+            echo "WARNING: KVM unavailable; software CPU emulation will be slow."
           fi
 
           adb start-server
 
-          echo "STEP 9: Launching Android 4.4..."
+          echo "STEP 8: Launching Android 4.4..."
 
           emulator -avd kitkat \
             -port 5554 \
@@ -241,8 +250,8 @@ jobs:
             -no-boot-anim \
             -verbose \
             >/tmp/android-emulator.log 2>&1 &
-
           EMULATOR_PID=$!
+
           DEVICE_READY=0
 
           for i in $(seq 1 180); do
@@ -291,11 +300,48 @@ jobs:
           done
 
           if [ "$BOOTED" != "1" ]; then
-            echo "ERROR: Android failed to boot."
+            echo "ERROR: Android did not finish booting."
             tail -n 200 /tmp/android-emulator.log
             exit 1
           fi
 
+          echo "STEP 9: Installing APK files..."
+
+          APK_DIR="$GITHUB_WORKSPACE/apks"
+          APK_FILES=()
+
+          if [ -d "$APK_DIR" ]; then
+            while IFS= read -r -d '' APK; do
+              APK_FILES+=("$APK")
+            done < <(find "$APK_DIR" -maxdepth 1 \
+              -type f -iname '*.apk' -print0 | sort -z)
+          fi
+
+          INSTALL_FAILURES=0
+
+          if [ "${#APK_FILES[@]}" -eq 0 ]; then
+            echo "No APK files found in the apks folder."
+          else
+            echo "Found ${#APK_FILES[@]} APK file(s)."
+
+            for APK in "${APK_FILES[@]}"; do
+              echo ""
+              echo "Installing: $(basename "$APK")"
+
+              if adb -s emulator-5554 install -r "$APK"; then
+                echo "Successfully installed: $(basename "$APK")"
+              else
+                echo "WARNING: Installation failed: $(basename "$APK")"
+                INSTALL_FAILURES=$((INSTALL_FAILURES + 1))
+              fi
+            done
+          fi
+
+          echo ""
+          echo "APK installation attempts finished."
+          echo "Failed APK installations: $INSTALL_FAILURES"
+
+          # Disable animations for a snappier UI.
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0
           adb shell settings put global animator_duration_scale 0
@@ -304,14 +350,14 @@ jobs:
           echo ""
           echo "ANDROID 4.4 IS READY."
           echo "Browser link: $BROWSER_URL"
-          echo "Keep this GitHub Actions job running."
+          echo "Keep this GitHub Actions workflow running."
 
           while kill -0 "$EMULATOR_PID" 2>/dev/null \
             && kill -0 "$TUNNEL_PID" 2>/dev/null; do
             sleep 30
           done
 
-          echo "ERROR: Emulator or tunnel stopped."
+          echo "ERROR: Emulator or Cloudflare Tunnel stopped."
           tail -n 100 /tmp/android-emulator.log
           cat /tmp/cloudflared.log
           exit 1
