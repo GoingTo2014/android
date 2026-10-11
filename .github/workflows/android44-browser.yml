@@ -1,57 +1,165 @@
+name: Android 4.4 Browser Emulator
 
-      - name: Boot Android 4.4 interactively
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  emulator:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Start remote desktop and tunnel
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$VNC_PASSWORD" ] || [ "${#VNC_PASSWORD}" -ne 8 ]; then
+            echo "Set repository secret VNC_PASSWORD to an 8-character password."
+            exit 1
+          fi
+
+          echo "::add-mask::$VNC_PASSWORD"
+
+          sudo apt-get update
+          sudo apt-get install -y xvfb openbox x11vnc novnc websockify curl
+
+          export DISPLAY=:0
+
+          nohup Xvfb :0 -screen 0 1280x800x24 \
+            -ac -nolisten tcp +extension GLX +render -noreset \
+            >/tmp/xvfb.log 2>&1 &
+
+          sleep 2
+
+          nohup openbox >/tmp/openbox.log 2>&1 &
+
+          x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass >/dev/null
+          chmod 600 /tmp/vnc.pass
+
+          nohup x11vnc -display :0 -forever -shared \
+            -localhost -rfbport 5900 -rfbauth /tmp/vnc.pass \
+            >/tmp/x11vnc.log 2>&1 &
+
+          nohup websockify --web=/usr/share/novnc \
+            127.0.0.1:6080 127.0.0.1:5900 \
+            >/tmp/novnc.log 2>&1 &
+
+          curl -fL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+            -o /tmp/cloudflared.deb
+
+          sudo dpkg -i /tmp/cloudflared.deb
+
+          nohup cloudflared tunnel \
+            --url http://127.0.0.1:6080 \
+            --no-autoupdate \
+            >/tmp/cloudflared.log 2>&1 &
+
+          URL=""
+
+          for i in $(seq 1 60); do
+            URL="$(grep -Eo \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log | head -n 1 || true)"
+
+            if [ -n "$URL" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            cat /tmp/cloudflared.log
+            echo "Could not create the browser tunnel."
+            exit 1
+          fi
+
+          {
+            echo "## Android 4.4 Emulator"
+            echo ""
+            echo "[Open Android in your browser]($URL/vnc.html?autoconnect=1&resize=remote)"
+            echo ""
+            echo "Enter the password stored in the VNC_PASSWORD repository secret."
+            echo "The emulator may take several more minutes to boot."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Android 4.4 and boot emulator
         env:
           DISPLAY: ":0"
         shell: bash
         run: |
           set -euo pipefail
 
-          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
 
-          SDKMANAGER="$(command -v sdkmanager || true)"
-          if [ -z "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-              -type f -name sdkmanager 2>/dev/null \
-              | sort -V | tail -n 1)"
-          fi
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null \
+            | sort -V | tail -n 1 || true)"
 
-          if [ -z "$SDKMANAGER" ] || [ ! -x "$ANDROID_HOME/emulator/emulator" ]; then
-            echo "Android SDK tools or emulator are missing."
+          if [ -z "$SDKMANAGER" ]; then
+            echo "Android SDK command-line tools were not found."
+            echo "ANDROID_HOME=$ANDROID_HOME"
             exit 1
           fi
 
+          AVDMANAGER="$(dirname "$SDKMANAGER")/avdmanager"
+
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$(dirname "$SDKMANAGER"):$PATH"
+
+          if [ ! -x "$AVDMANAGER" ]; then
+            echo "avdmanager was not found beside sdkmanager."
+            exit 1
+          fi
 
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
             --licenses >/dev/null 2>&1 || true
 
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
+            "emulator" \
             "platform-tools" \
             "platforms;android-19" \
             "system-images;android-19;default;x86"
 
-          echo no | avdmanager create avd \
+          echo no | "$AVDMANAGER" create avd \
             --force \
             --name kitkat \
             --package "system-images;android-19;default;x86"
 
           adb start-server
 
+          if [ -e /dev/kvm ]; then
+            sudo chmod a+rw /dev/kvm || true
+            ACCEL=on
+          else
+            ACCEL=off
+            echo "KVM is unavailable; emulator may run slowly."
+          fi
+
           emulator -avd kitkat \
             -port 5554 \
+            -accel "$ACCEL" \
             -gpu swiftshader_indirect \
             -no-snapshot \
             -noaudio \
             -no-boot-anim \
             -verbose \
-            > /tmp/android-emulator.log 2>&1 &
+            >/tmp/android-emulator.log 2>&1 &
+
+          EMULATOR_PID=$!
+          BOOTED=""
 
           echo "Waiting for Android 4.4 to boot..."
 
-          BOOTED=""
           for i in $(seq 1 180); do
-            if ! kill -0 "$!" 2>/dev/null; then
+            if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
               echo "Emulator process exited unexpectedly."
               tail -n 200 /tmp/android-emulator.log
               exit 1
@@ -61,6 +169,7 @@
               BOOTED="$(adb -s emulator-5554 shell \
                 getprop sys.boot_completed 2>/dev/null \
                 | tr -d '\r' || true)"
+
               if [ "$BOOTED" = "1" ]; then
                 break
               fi
@@ -76,7 +185,7 @@
             exit 1
           fi
 
-          echo "Android 4.4 is running."
+          echo "Android 4.4 is running!"
           adb shell getprop ro.build.version.release
 
           while true; do sleep 60; done
