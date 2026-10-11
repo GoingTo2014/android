@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Start rooted Android 4.4 in browser
+      - name: Start Android 4.4 in browser
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -30,13 +30,13 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
 
           if [ -z "${VNC_PASSWORD:-}" ] || [ "${#VNC_PASSWORD}" -ne 8 ]; then
-            echo "ERROR: Configure VNC_PASSWORD as an 8-character Actions secret."
+            echo "ERROR: Set VNC_PASSWORD as an 8-character Actions secret."
             exit 1
           fi
 
           echo "::add-mask::$VNC_PASSWORD"
 
-          echo "STEP 1: Installing desktop and audio dependencies..."
+          echo "STEP 1: Installing dependencies..."
 
           sudo apt-get update
           sudo apt-get install -y \
@@ -46,28 +46,11 @@ jobs:
             libxi6 libxrandr2 libxcursor1 libxcomposite1 \
             libxdamage1 libxfixes3 libxkbcommon0 \
             libxkbcommon-x11-0 libxcb-xinerama0 \
-            build-essential python3 pkg-config libopus-dev
+            build-essential python3 pkg-config libopus-dev unzip
 
           npm install --global pnpm@10.17.0
 
-          echo "STEP 2: Downloading Android root files..."
-
-          git clone --depth 1 \
-            https://github.com/peripheralmike/Root-Android-Emulator.git \
-            /tmp/root-avd
-
-          SU_BINARY="/tmp/root-avd/SuperSU/x86/su"
-          SU_MANAGER="/tmp/root-avd/SuperSU/common/Superuser.apk"
-
-          if [ ! -f "$SU_BINARY" ] || [ ! -f "$SU_MANAGER" ]; then
-            echo "ERROR: Expected x86 SuperSU files were not found."
-            find /tmp/root-avd/SuperSU -maxdepth 3 -type f | head -n 100
-            exit 1
-          fi
-
-          echo "Found SuperSU x86 binary and manager APK."
-
-          echo "STEP 3: Starting the virtual desktop..."
+          echo "STEP 2: Starting virtual desktop..."
 
           export DISPLAY=:0
 
@@ -85,16 +68,16 @@ jobs:
 
           openbox >/tmp/openbox.log 2>&1 &
 
-          x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass \
-            >/dev/null
+          x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass >/dev/null
           chmod 600 /tmp/vnc.pass
 
           x11vnc -display :0 -forever -shared \
-            -localhost -rfbport 5900 \
-            -rfbauth /tmp/vnc.pass -wait 10 -defer 10 \
+            -localhost -rfbport 5900 -rfbauth /tmp/vnc.pass \
+            -wait 10 -defer 10 \
             >/tmp/x11vnc.log 2>&1 &
+          VNC_PID=$!
 
-          echo "STEP 4: Preparing audio-enabled noVNC..."
+          echo "STEP 3: Building audio-enabled noVNC..."
 
           git clone --depth 1 \
             https://github.com/babelcloud/noVNC.git \
@@ -103,25 +86,29 @@ jobs:
           (
             cd /tmp/babelcloud-novnc
             bash ./build.sh
-
-            if [ -f defaults.json ]; then
-              cp defaults.json build/
-            fi
-
-            if [ -f mandatory.json ]; then
-              cp mandatory.json build/
-            fi
           )
 
           if [ ! -f /tmp/babelcloud-novnc/build/vnc.html ]; then
-            echo "ERROR: noVNC build did not produce vnc.html."
+            echo "ERROR: noVNC did not create build/vnc.html."
             exit 1
           fi
 
+          echo "noVNC build successful."
+
+          echo "STEP 4: Starting WebSocket proxy..."
+
           websockify 127.0.0.1:6081 127.0.0.1:5900 \
             >/tmp/websockify.log 2>&1 &
+          WEBSOCKIFY_PID=$!
 
-          echo "STEP 5: Configuring Nginx..."
+          sleep 2
+
+          if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
+            cat /tmp/websockify.log
+            exit 1
+          fi
+
+          echo "STEP 5: Configuring Nginx WebSocket routes..."
 
           sudo tee /etc/nginx/conf.d/android44.conf >/dev/null <<'NGINX'
           server {
@@ -131,8 +118,10 @@ jobs:
               root /tmp/babelcloud-novnc/build;
               index vnc.html;
 
-              location /websockify {
-                  proxy_pass http://127.0.0.1:6081;
+              # The BabelCloud noVNC fork derives its WebSocket
+              # path from vnc.html, producing /vnc.html/ws.
+              location = /vnc.html/ws {
+                  proxy_pass http://127.0.0.1:6081/;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
@@ -141,6 +130,18 @@ jobs:
                   proxy_buffering off;
               }
 
+              # Support clients that use the standard noVNC path.
+              location = /websockify {
+                  proxy_pass http://127.0.0.1:6081/;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+                  proxy_buffering off;
+              }
+
+              # Same-origin audio WebSocket endpoint.
               location = /audio {
                   proxy_pass http://127.0.0.1:6090/audio;
                   proxy_http_version 1.1;
@@ -152,6 +153,7 @@ jobs:
               }
 
               location / {
+                  add_header Cache-Control "no-cache" always;
                   try_files $uri $uri/ =404;
               }
           }
@@ -160,24 +162,18 @@ jobs:
           sudo nginx -t
           sudo service nginx restart
 
-          echo "Checking the noVNC page..."
+          echo "Testing noVNC web page..."
 
-          HTTP_READY=0
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null; then
-              HTTP_READY=1
-              break
-            fi
-            sleep 1
-          done
-
-          if [ "$HTTP_READY" -ne 1 ]; then
-            echo "ERROR: noVNC is unavailable."
-            cat /tmp/websockify.log
+          if ! curl -fsS \
+            http://127.0.0.1:6080/vnc.html >/dev/null; then
+            echo "ERROR: noVNC page is not responding."
+            sudo nginx -T
             exit 1
           fi
 
-          echo "STEP 6: Creating the Cloudflare browser link..."
+          echo "noVNC page is responding."
+
+          echo "STEP 6: Creating Cloudflare tunnel..."
 
           curl -fL --retry 3 \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
@@ -207,7 +203,7 @@ jobs:
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "ERROR: Cloudflare Tunnel exited."
+              echo "ERROR: Cloudflare Tunnel stopped."
               cat /tmp/cloudflared.log
               exit 1
             fi
@@ -221,7 +217,7 @@ jobs:
             exit 1
           fi
 
-          BROWSER_URL="${URL}/vnc.html#autoconnect=true&path=websockify&resize=scale&quality=5&compression=1"
+          BROWSER_URL="${URL}/vnc.html?autoconnect=true&resize=scale&quality=5&compression=1"
 
           echo ""
           echo "================================================"
@@ -232,7 +228,15 @@ jobs:
 
           echo "::notice title=ANDROID 4.4 BROWSER LINK::$BROWSER_URL"
 
-          echo "STEP 7: Preparing the Android SDK..."
+          {
+            echo "## Android 4.4 Browser Emulator"
+            echo ""
+            echo "**Browser link:** $BROWSER_URL"
+            echo ""
+            echo "Open this link while the workflow is running."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "STEP 7: Preparing Android SDK..."
 
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
@@ -242,7 +246,7 @@ jobs:
             | sort -V | tail -n 1 || true)"
 
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: Android sdkmanager was not found."
+            echo "ERROR: sdkmanager was not found."
             echo "ANDROID_HOME=$ANDROID_HOME"
             exit 1
           fi
@@ -259,7 +263,7 @@ jobs:
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
             --licenses >/dev/null 2>&1 || true
 
-          echo "Installing Android 4.4 x86..."
+          echo "Installing Android 4.4 image..."
 
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
             "emulator" \
@@ -285,7 +289,7 @@ jobs:
             fi
           }
 
-          echo "STEP 8: Configuring the virtual SD card..."
+          echo "STEP 8: Configuring screen and SD card..."
 
           set_avd_property hw.lcd.width 360
           set_avd_property hw.lcd.height 640
@@ -305,13 +309,13 @@ jobs:
             -l KitKatSD 512M "$SDCARD_IMAGE"
 
           if [ ! -s "$SDCARD_IMAGE" ]; then
-            echo "ERROR: Failed to create SD card."
+            echo "ERROR: Failed to create virtual SD card."
             exit 1
           fi
 
           ls -lh "$SDCARD_IMAGE"
 
-          echo "STEP 9: Checking hardware acceleration..."
+          echo "STEP 9: Checking CPU acceleration..."
 
           if [ -e /dev/kvm ]; then
             sudo chmod a+rw /dev/kvm 2>/dev/null || true
@@ -322,10 +326,31 @@ jobs:
             echo "KVM is available."
           else
             ACCEL=off
-            echo "WARNING: KVM unavailable; emulation may be slow."
+            echo "WARNING: KVM unavailable; Android may run slowly."
           fi
 
-          echo "STEP 10: Setting up PulseAudio..."
+          echo "STEP 10: Preparing root files..."
+
+          ROOT_FILES_OK=0
+
+          if git clone --depth 1 \
+            https://github.com/peripheralmike/Root-Android-Emulator.git \
+            /tmp/root-avd; then
+
+            SU_BINARY="/tmp/root-avd/SuperSU/x86/su"
+            SU_MANAGER="/tmp/root-avd/SuperSU/common/Superuser.apk"
+
+            if [ -f "$SU_BINARY" ] && [ -f "$SU_MANAGER" ]; then
+              ROOT_FILES_OK=1
+              echo "SuperSU x86 files found."
+            else
+              echo "WARNING: SuperSU files were not at the expected paths."
+            fi
+          else
+            echo "WARNING: Could not download SuperSU files."
+          fi
+
+          echo "STEP 11: Starting PulseAudio..."
 
           AUDIO_ENABLED=1
           AUDIO_PID=""
@@ -356,9 +381,9 @@ jobs:
                 sink_properties=device.description=AndroidAudioSink \
                 rate=48000 channels=2; then
                 pactl set-default-sink android_sink
-                echo "PulseAudio sink created."
+                echo "PulseAudio sink is ready."
               else
-                echo "WARNING: Audio sink creation failed."
+                echo "WARNING: Could not create audio sink."
                 AUDIO_ENABLED=0
               fi
             else
@@ -371,7 +396,7 @@ jobs:
             AUDIO_ENABLED=0
           fi
 
-          echo "STEP 11: Building the audio server..."
+          echo "STEP 12: Starting optional audio server..."
 
           if [ "$AUDIO_ENABLED" -eq 1 ]; then
             if git clone --depth 1 \
@@ -402,10 +427,9 @@ jobs:
                 sleep 3
 
                 if kill -0 "$AUDIO_PID" 2>/dev/null; then
-                  echo "Audio server started."
-                  cat /tmp/audio-server.log
+                  echo "Audio server process started."
                 else
-                  echo "WARNING: Audio server failed to start."
+                  echo "WARNING: Audio server did not start."
                   cat /tmp/audio-server.log
                   AUDIO_ENABLED=0
                   AUDIO_PID=""
@@ -415,12 +439,12 @@ jobs:
                 AUDIO_ENABLED=0
               fi
             else
-              echo "WARNING: Audio server download failed."
+              echo "WARNING: Could not download audio server."
               AUDIO_ENABLED=0
             fi
           fi
 
-          echo "STEP 12: Starting Android 4.4..."
+          echo "STEP 13: Launching Android 4.4..."
 
           adb start-server
 
@@ -445,7 +469,7 @@ jobs:
 
           for i in $(seq 1 180); do
             if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "ERROR: Emulator process exited."
+              echo "ERROR: Emulator exited."
               tail -n 200 /tmp/android-emulator.log
               exit 1
             fi
@@ -466,7 +490,7 @@ jobs:
             exit 1
           fi
 
-          echo "Waiting for Android to boot..."
+          echo "Waiting for Android to finish booting..."
 
           BOOTED=""
 
@@ -494,72 +518,56 @@ jobs:
             exit 1
           fi
 
-          echo "STEP 13: Installing application root access..."
+          echo "STEP 14: Attempting app root access..."
 
-          adb -s emulator-5554 root
-          adb -s emulator-5554 wait-for-device
+          ROOTED=0
 
-          ADB_ROOT_OK=0
+          if adb -s emulator-5554 root; then
+            adb -s emulator-5554 wait-for-device || true
+            sleep 2
 
-          for i in $(seq 1 20); do
             ROOT_ID="$(adb -s emulator-5554 shell id 2>/dev/null \
               | tr -d '\r' || true)"
 
             echo "$ROOT_ID"
 
             if [[ "$ROOT_ID" == *"uid=0(root)"* ]]; then
-              ADB_ROOT_OK=1
-              break
+              adb -s emulator-5554 remount || true
+
+              if [ "$ROOT_FILES_OK" -eq 1 ]; then
+                if adb -s emulator-5554 install -r "$SU_MANAGER" \
+                  && adb -s emulator-5554 push "$SU_BINARY" /system/xbin/su; then
+
+                  adb -s emulator-5554 shell \
+                    chown 0:0 /system/xbin/su || true
+                  adb -s emulator-5554 shell \
+                    chmod 0755 /system/xbin/su || true
+                  adb -s emulator-5554 shell \
+                    setenforce 0 || true
+                  adb -s emulator-5554 shell \
+                    /system/xbin/su --install || true
+                  adb -s emulator-5554 shell \
+                    "su --daemon >/dev/null 2>&1 &" || true
+
+                  if adb -s emulator-5554 shell \
+                    'test -x /system/xbin/su'; then
+                    ROOTED=1
+                  fi
+                else
+                  echo "WARNING: SuperSU installation failed."
+                fi
+              fi
             fi
-
-            sleep 1
-          done
-
-          if [ "$ADB_ROOT_OK" -ne 1 ]; then
-            echo "ERROR: ADB root is unavailable."
-            exit 1
           fi
 
-          adb -s emulator-5554 remount
-
-          echo "Installing SuperSU manager..."
-
-          adb -s emulator-5554 install -r "$SU_MANAGER"
-
-          echo "Copying x86 su binary into /system..."
-
-          adb -s emulator-5554 push \
-            "$SU_BINARY" /system/xbin/su
-
-          adb -s emulator-5554 shell \
-            chown 0:0 /system/xbin/su
-
-          adb -s emulator-5554 shell \
-            chmod 0755 /system/xbin/su
-
-          adb -s emulator-5554 shell \
-            setenforce 0 || true
-
-          echo "Initializing SuperSU..."
-
-          adb -s emulator-5554 shell \
-            /system/xbin/su --install || true
-
-          adb -s emulator-5554 shell \
-            "su --daemon >/dev/null 2>&1 &" || true
-
-          if adb -s emulator-5554 shell \
-            'test -x /system/xbin/su'; then
-            echo "SU_INSTALLED=1"
+          if [ "$ROOTED" -eq 1 ]; then
+            echo "SU binary installed."
           else
-            echo "ERROR: su binary installation failed."
-            exit 1
+            echo "WARNING: App root could not be confirmed."
+            echo "ADB root may still be available."
           fi
 
-          adb -s emulator-5554 shell \
-            ls -l /system/xbin/su
-
-          echo "STEP 14: Checking SD card mount..."
+          echo "STEP 15: Checking SD card..."
 
           adb -s emulator-5554 shell \
             'ls -ld /sdcard /mnt/sdcard /storage/sdcard0 2>/dev/null || true'
@@ -567,7 +575,7 @@ jobs:
           adb -s emulator-5554 shell \
             'mount | grep -Ei "sdcard|vfat" || true'
 
-          echo "STEP 15: Installing APKs from apks/..."
+          echo "STEP 16: Installing APKs from apks/..."
 
           APK_DIR="$GITHUB_WORKSPACE/apks"
           APK_FILES=()
@@ -597,27 +605,24 @@ jobs:
             done
           fi
 
-          echo "STEP 16: Applying performance settings..."
+          echo "STEP 17: Applying performance settings..."
 
           adb -s emulator-5554 shell \
             settings put global window_animation_scale 0
-
           adb -s emulator-5554 shell \
             settings put global transition_animation_scale 0
-
           adb -s emulator-5554 shell \
             settings put global animator_duration_scale 0
-
           adb -s emulator-5554 shell \
             settings put system screen_off_timeout 2147483647
 
           echo ""
           echo "================================================"
-          echo "ANDROID 4.4 IS READY"
+          echo "ANDROID 4.4 IS READY."
           echo "YOUR ANDROID 4.4 BROWSER LINK:"
           echo "$BROWSER_URL"
-          echo "ADB ROOT: $ADB_ROOT_OK"
-          echo "SU INSTALLED: 1"
+          echo "ADB ROOT: $(adb -s emulator-5554 shell id 2>/dev/null || true)"
+          echo "APP ROOT SETUP: $ROOTED"
           echo "SD CARD: 512 MB"
           echo "AUDIO ENABLED: $AUDIO_ENABLED"
           echo "APK DIRECTORY: apks/"
@@ -625,7 +630,6 @@ jobs:
 
           while kill -0 "$EMULATOR_PID" 2>/dev/null \
             && kill -0 "$TUNNEL_PID" 2>/dev/null; do
-
             if [ "$AUDIO_ENABLED" -eq 1 ] \
               && [ -n "$AUDIO_PID" ] \
               && ! kill -0 "$AUDIO_PID" 2>/dev/null; then
