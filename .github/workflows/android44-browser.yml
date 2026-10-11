@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Start Android 4.4 with browser audio
+      - name: Start Android 4.4 with SD card, audio and APKs
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -30,7 +30,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
 
           if [ -z "${VNC_PASSWORD:-}" ] || [ "${#VNC_PASSWORD}" -ne 8 ]; then
-            echo "ERROR: Configure VNC_PASSWORD as an 8-character repository secret."
+            echo "ERROR: Set repository secret VNC_PASSWORD to exactly 8 characters."
             exit 1
           fi
 
@@ -48,6 +48,8 @@ jobs:
             libxkbcommon-x11-0 libxcb-xinerama0 \
             build-essential python3 pkg-config libopus-dev
 
+          npm install --global pnpm@10
+
           echo "STEP 2: Starting the virtual desktop..."
 
           export DISPLAY=:0
@@ -61,6 +63,7 @@ jobs:
 
           if ! kill -0 "$XVFB_PID" 2>/dev/null; then
             cat /tmp/xvfb.log
+            echo "ERROR: Xvfb failed to start."
             exit 1
           fi
 
@@ -84,15 +87,24 @@ jobs:
 
           (
             cd /tmp/babelcloud-novnc
-            bash ./build.sh
+            pnpm install --no-frozen-lockfile
+            pnpm run build
           )
 
-          # Expose the VNC WebSocket internally.
+          if [ ! -f /tmp/babelcloud-novnc/build/vnc.html ]; then
+            echo "ERROR: noVNC build did not produce build/vnc.html."
+            find /tmp/babelcloud-novnc -maxdepth 3 \
+              -name vnc.html -print
+            exit 1
+          fi
+
+          echo "Starting WebSocket proxy..."
+
           websockify 127.0.0.1:6081 127.0.0.1:5900 \
             >/tmp/websockify.log 2>&1 &
           WEBSOCKIFY_PID=$!
 
-          echo "STEP 4: Configuring the web server..."
+          echo "STEP 4: Configuring the browser server..."
 
           sudo tee /etc/nginx/conf.d/android44.conf >/dev/null <<'NGINX'
           server {
@@ -102,16 +114,17 @@ jobs:
               root /tmp/babelcloud-novnc/build;
               index vnc.html;
 
-              location = /audio {
-                  proxy_pass http://127.0.0.1:6090/audio;
+              location /websockify {
+                  proxy_pass http://127.0.0.1:6081/;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
                   proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
               }
 
-              location = /vnc.html/ws {
-                  proxy_pass http://127.0.0.1:6081;
+              location = /audio {
+                  proxy_pass http://127.0.0.1:6090/audio;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
@@ -126,11 +139,29 @@ jobs:
           NGINX
 
           sudo nginx -t
-          sudo nginx
+          sudo service nginx restart
 
-          echo "STEP 5: Creating the Cloudflare browser link..."
+          echo "Checking noVNC..."
 
-          curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null
+          HTTP_READY=0
+
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://127.0.0.1:6080/vnc.html \
+              >/dev/null; then
+              HTTP_READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$HTTP_READY" -ne 1 ]; then
+            echo "ERROR: noVNC is not responding."
+            cat /tmp/websockify.log
+            exit 1
+          fi
+
+          echo "STEP 5: Starting Cloudflare Tunnel..."
 
           curl -fL --retry 3 \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
@@ -160,6 +191,7 @@ jobs:
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "ERROR: Cloudflare Tunnel stopped."
               cat /tmp/cloudflared.log
               exit 1
             fi
@@ -182,7 +214,7 @@ jobs:
           echo "============================================"
           echo ""
 
-          echo "::notice title=Android Browser Link::$BROWSER_URL"
+          echo "::notice title=Android 4.4 Browser Link::$BROWSER_URL"
 
           echo "STEP 6: Setting up PulseAudio..."
 
@@ -192,6 +224,7 @@ jobs:
           export XDG_RUNTIME_DIR="/tmp/runtime-${UID}"
           mkdir -p "$XDG_RUNTIME_DIR"
           chmod 700 "$XDG_RUNTIME_DIR"
+          export PULSE_SERVER="unix:${XDG_RUNTIME_DIR}/pulse/native"
 
           if pulseaudio \
             --daemonize=yes \
@@ -209,15 +242,19 @@ jobs:
             done
 
             if [ "$PULSE_READY" -eq 1 ]; then
-              pactl load-module module-null-sink \
+              if pactl load-module module-null-sink \
                 sink_name=android_sink \
                 sink_properties=device.description=AndroidAudioSink \
-                rate=48000 channels=2
-
-              pactl set-default-sink android_sink
-              echo "PulseAudio sink and monitor are ready."
+                rate=48000 channels=2; then
+                pactl set-default-sink android_sink
+                echo "PulseAudio audio sink is ready."
+              else
+                echo "WARNING: Could not create audio sink."
+                AUDIO_ENABLED=0
+              fi
             else
               echo "WARNING: PulseAudio did not become ready."
+              cat /tmp/pulseaudio.log || true
               AUDIO_ENABLED=0
             fi
           else
@@ -225,7 +262,7 @@ jobs:
             AUDIO_ENABLED=0
           fi
 
-          echo "STEP 7: Starting the browser audio server..."
+          echo "STEP 7: Building the audio server..."
 
           if [ "$AUDIO_ENABLED" -eq 1 ]; then
             if git clone --depth 1 \
@@ -234,8 +271,8 @@ jobs:
 
               if (
                 cd /tmp/novnc-audio-server
-                npm install --no-audit --no-fund
-                npm run build
+                pnpm install --no-frozen-lockfile
+                pnpm run build
               ); then
 
                 (
@@ -256,25 +293,25 @@ jobs:
                 sleep 3
 
                 if kill -0 "$AUDIO_PID" 2>/dev/null; then
-                  echo "Audio server started."
+                  echo "Audio server process started."
                   cat /tmp/audio-server.log
                 else
-                  echo "WARNING: Audio server exited during startup."
+                  echo "WARNING: Audio server failed to start."
                   cat /tmp/audio-server.log
                   AUDIO_ENABLED=0
+                  AUDIO_PID=""
                 fi
               else
                 echo "WARNING: Audio server build failed."
-                echo "Continuing with video-only mode."
                 AUDIO_ENABLED=0
               fi
             else
-              echo "WARNING: Could not download the audio server."
+              echo "WARNING: Could not download audio server."
               AUDIO_ENABLED=0
             fi
           fi
 
-          echo "STEP 8: Preparing the Android SDK..."
+          echo "STEP 8: Preparing Android SDK..."
 
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
@@ -284,7 +321,8 @@ jobs:
             | sort -V | tail -n 1 || true)"
 
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager was not found."
+            echo "ERROR: Android sdkmanager was not found."
+            echo "ANDROID_HOME=$ANDROID_HOME"
             exit 1
           fi
 
@@ -299,6 +337,8 @@ jobs:
 
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
             --licenses >/dev/null 2>&1 || true
+
+          echo "Installing Android 4.4 x86 image..."
 
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
             "emulator" \
@@ -324,6 +364,7 @@ jobs:
             fi
           }
 
+          # Performance and display settings.
           set_avd_property hw.lcd.width 360
           set_avd_property hw.lcd.height 640
           set_avd_property hw.lcd.density 160
@@ -331,6 +372,27 @@ jobs:
           set_avd_property hw.ramSize 1536
           set_avd_property vm.heapSize 128
           set_avd_property hw.keyboard yes
+
+          # Configure and create the virtual SD card.
+          echo "Creating a 512 MB virtual SD card..."
+
+          set_avd_property hw.sdCard yes
+          set_avd_property sdcard.size 512M
+
+          SDCARD_IMAGE="$HOME/.android/avd/kitkat.avd/sdcard.img"
+
+          rm -f "$SDCARD_IMAGE"
+
+          "$ANDROID_HOME/emulator/mksdcard" \
+            -l KitKatSD 512M "$SDCARD_IMAGE"
+
+          if [ ! -s "$SDCARD_IMAGE" ]; then
+            echo "ERROR: Failed to create the SD card image."
+            exit 1
+          fi
+
+          ls -lh "$SDCARD_IMAGE"
+          echo "SD card image created successfully."
 
           echo "STEP 9: Checking hardware acceleration..."
 
@@ -343,15 +405,16 @@ jobs:
             echo "KVM is available."
           else
             ACCEL=off
-            echo "WARNING: KVM is unavailable; emulation may be slow."
+            echo "WARNING: KVM unavailable; emulation may be slow."
           fi
 
           adb start-server
 
-          echo "STEP 10: Launching Android 4.4..."
+          echo "STEP 10: Launching Android 4.4 with SD card..."
 
           if [ "$AUDIO_ENABLED" -eq 1 ]; then
             QEMU_AUDIO_DRV=pa emulator -avd kitkat \
+              -sdcard "$SDCARD_IMAGE" \
               -port 5554 \
               -accel "$ACCEL" \
               -gpu swiftshader \
@@ -361,6 +424,7 @@ jobs:
               >/tmp/android-emulator.log 2>&1 &
           else
             emulator -avd kitkat \
+              -sdcard "$SDCARD_IMAGE" \
               -port 5554 \
               -accel "$ACCEL" \
               -gpu swiftshader \
@@ -424,7 +488,16 @@ jobs:
             exit 1
           fi
 
-          echo "STEP 11: Installing APKs..."
+          echo "Android has booted."
+          echo "Checking SD card mount..."
+
+          adb -s emulator-5554 shell \
+            'ls -ld /sdcard /mnt/sdcard /storage/sdcard0 2>/dev/null || true'
+
+          adb -s emulator-5554 shell \
+            'mount | grep -Ei "sdcard|vfat" || true'
+
+          echo "STEP 11: Installing APK files..."
 
           APK_DIR="$GITHUB_WORKSPACE/apks"
           APK_FILES=()
@@ -441,13 +514,20 @@ jobs:
           if [ "${#APK_FILES[@]}" -eq 0 ]; then
             echo "No APK files found in the apks folder."
           else
+            echo "Found ${#APK_FILES[@]} APK file(s)."
+
             for APK in "${APK_FILES[@]}"; do
               echo "Installing $(basename "$APK")..."
-              if ! adb -s emulator-5554 install -r "$APK"; then
+
+              if adb -s emulator-5554 install -r "$APK"; then
+                echo "Successfully installed $(basename "$APK")."
+              else
                 echo "WARNING: Failed to install $(basename "$APK")."
               fi
             done
           fi
+
+          echo "STEP 12: Applying Android settings..."
 
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0
@@ -457,9 +537,11 @@ jobs:
           echo ""
           echo "ANDROID 4.4 IS READY."
           echo "Browser link: $BROWSER_URL"
+          echo "Virtual SD card: 512 MB"
           echo "Audio enabled: $AUDIO_ENABLED"
-          echo "Click the noVNC page once to allow browser audio playback."
-          echo "Keep this workflow running."
+          echo "APK folder: apks/"
+          echo "Click the browser page once to enable audio playback."
+          echo "Keep this GitHub Actions workflow running."
 
           while kill -0 "$EMULATOR_PID" 2>/dev/null \
             && kill -0 "$TUNNEL_PID" 2>/dev/null; do
@@ -470,11 +552,12 @@ jobs:
               echo "WARNING: Audio server stopped."
               cat /tmp/audio-server.log
               AUDIO_ENABLED=0
+              AUDIO_PID=""
             fi
 
             sleep 30
           done
 
-          echo "ERROR: Emulator or tunnel stopped."
+          echo "ERROR: Emulator or Cloudflare Tunnel stopped."
           tail -n 100 /tmp/android-emulator.log
           cat /tmp/cloudflared.log
