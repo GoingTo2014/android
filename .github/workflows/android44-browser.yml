@@ -16,7 +16,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Start Android 4.4 and browser tunnel
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Start Android 4.4 with browser audio
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -24,26 +29,26 @@ jobs:
           set -Eeuo pipefail
           export DEBIAN_FRONTEND=noninteractive
 
-          echo "STEP 1: Checking configuration..."
-
           if [ -z "${VNC_PASSWORD:-}" ] || [ "${#VNC_PASSWORD}" -ne 8 ]; then
-            echo "ERROR: Set repository secret VNC_PASSWORD to exactly 8 characters."
+            echo "ERROR: Configure VNC_PASSWORD as an 8-character repository secret."
             exit 1
           fi
 
           echo "::add-mask::$VNC_PASSWORD"
 
-          echo "STEP 2: Installing desktop dependencies..."
+          echo "STEP 1: Installing dependencies..."
 
           sudo apt-get update
           sudo apt-get install -y \
-            xvfb openbox x11vnc novnc websockify curl ca-certificates \
-            libpulse0 libasound2 libnss3 libglu1-mesa \
-            libx11-6 libxrender1 libxtst6 libxi6 libxrandr2 \
-            libxcursor1 libxcomposite1 libxdamage1 libxfixes3 \
-            libxkbcommon0 libxkbcommon-x11-0 libxcb-xinerama0
+            xvfb openbox x11vnc websockify nginx curl ca-certificates git \
+            libpulse0 pulseaudio pulseaudio-utils libasound2 \
+            libnss3 libglu1-mesa libx11-6 libxrender1 libxtst6 \
+            libxi6 libxrandr2 libxcursor1 libxcomposite1 \
+            libxdamage1 libxfixes3 libxkbcommon0 \
+            libxkbcommon-x11-0 libxcb-xinerama0 \
+            build-essential python3 pkg-config libopus-dev
 
-          echo "STEP 3: Starting virtual desktop..."
+          echo "STEP 2: Starting the virtual desktop..."
 
           export DISPLAY=:0
 
@@ -56,7 +61,6 @@ jobs:
 
           if ! kill -0 "$XVFB_PID" 2>/dev/null; then
             cat /tmp/xvfb.log
-            echo "ERROR: Virtual display failed to start."
             exit 1
           fi
 
@@ -67,49 +71,72 @@ jobs:
           chmod 600 /tmp/vnc.pass
 
           x11vnc -display :0 -forever -shared \
-            -localhost -rfbport 5900 \
-            -rfbauth /tmp/vnc.pass \
+            -localhost -rfbport 5900 -rfbauth /tmp/vnc.pass \
             -wait 10 -defer 10 \
             >/tmp/x11vnc.log 2>&1 &
           VNC_PID=$!
 
-          websockify --web=/usr/share/novnc \
-            127.0.0.1:6080 127.0.0.1:5900 \
-            >/tmp/novnc.log 2>&1 &
+          echo "STEP 3: Building the audio-enabled noVNC client..."
+
+          git clone --depth 1 \
+            https://github.com/babelcloud/noVNC.git \
+            /tmp/babelcloud-novnc
+
+          (
+            cd /tmp/babelcloud-novnc
+            bash ./build.sh
+          )
+
+          # Expose the VNC WebSocket internally.
+          websockify 127.0.0.1:6081 127.0.0.1:5900 \
+            >/tmp/websockify.log 2>&1 &
           WEBSOCKIFY_PID=$!
 
-          echo "Checking noVNC..."
+          echo "STEP 4: Configuring the web server..."
 
-          HTTP_READY=0
+          sudo tee /etc/nginx/conf.d/android44.conf >/dev/null <<'NGINX'
+          server {
+              listen 127.0.0.1:6080;
+              server_name _;
 
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:6080/vnc.html \
-              >/dev/null; then
-              HTTP_READY=1
-              break
-            fi
-            sleep 1
-          done
+              root /tmp/babelcloud-novnc/build;
+              index vnc.html;
 
-          if [ "$HTTP_READY" -ne 1 ]; then
-            echo "ERROR: noVNC did not start."
-            cat /tmp/novnc.log
-            cat /tmp/x11vnc.log
-            exit 1
-          fi
+              location = /audio {
+                  proxy_pass http://127.0.0.1:6090/audio;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 3600s;
+              }
 
-          echo "STEP 4: Installing Cloudflare Tunnel..."
+              location = /vnc.html/ws {
+                  proxy_pass http://127.0.0.1:6081;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+              }
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+          }
+          NGINX
+
+          sudo nginx -t
+          sudo nginx
+
+          echo "STEP 5: Creating the Cloudflare browser link..."
+
+          curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null
 
           curl -fL --retry 3 \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
             -o /tmp/cloudflared.deb
 
           sudo dpkg -i /tmp/cloudflared.deb
-
-          echo "STEP 5: Creating browser link..."
-          echo "Waiting for Cloudflare to generate a URL..."
-
-          : > /tmp/cloudflared.log
 
           cloudflared tunnel \
             --url http://127.0.0.1:6080 \
@@ -118,7 +145,6 @@ jobs:
             >/tmp/cloudflared.log 2>&1 &
           TUNNEL_PID=$!
 
-          # Show Cloudflare output in the live Actions logs.
           tail -n +1 -F /tmp/cloudflared.log &
           LOG_TAIL_PID=$!
 
@@ -134,7 +160,6 @@ jobs:
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "ERROR: Cloudflare Tunnel stopped."
               cat /tmp/cloudflared.log
               exit 1
             fi
@@ -143,8 +168,7 @@ jobs:
           done
 
           if [ -z "$URL" ]; then
-            echo "ERROR: Cloudflare URL was not detected."
-            echo "Cloudflare output:"
+            echo "ERROR: No Cloudflare URL was generated."
             cat /tmp/cloudflared.log
             exit 1
           fi
@@ -152,15 +176,105 @@ jobs:
           BROWSER_URL="${URL}/vnc.html?autoconnect=true&resize=scale&quality=5&compression=1"
 
           echo ""
-          echo "================================================"
+          echo "============================================"
           echo "YOUR ANDROID 4.4 BROWSER LINK:"
           echo "$BROWSER_URL"
-          echo "================================================"
+          echo "============================================"
           echo ""
 
-          echo "::notice title=Android 4.4 Browser Link::$BROWSER_URL"
+          echo "::notice title=Android Browser Link::$BROWSER_URL"
 
-          echo "STEP 6: Preparing Android SDK..."
+          echo "STEP 6: Setting up PulseAudio..."
+
+          AUDIO_ENABLED=1
+          AUDIO_PID=""
+
+          export XDG_RUNTIME_DIR="/tmp/runtime-${UID}"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+
+          if pulseaudio \
+            --daemonize=yes \
+            --exit-idle-time=-1 \
+            --log-target=file:/tmp/pulseaudio.log; then
+
+            PULSE_READY=0
+
+            for i in $(seq 1 20); do
+              if pactl info >/dev/null 2>&1; then
+                PULSE_READY=1
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$PULSE_READY" -eq 1 ]; then
+              pactl load-module module-null-sink \
+                sink_name=android_sink \
+                sink_properties=device.description=AndroidAudioSink \
+                rate=48000 channels=2
+
+              pactl set-default-sink android_sink
+              echo "PulseAudio sink and monitor are ready."
+            else
+              echo "WARNING: PulseAudio did not become ready."
+              AUDIO_ENABLED=0
+            fi
+          else
+            echo "WARNING: PulseAudio failed to start."
+            AUDIO_ENABLED=0
+          fi
+
+          echo "STEP 7: Starting the browser audio server..."
+
+          if [ "$AUDIO_ENABLED" -eq 1 ]; then
+            if git clone --depth 1 \
+              https://github.com/babelcloud/novnc-audio-server.git \
+              /tmp/novnc-audio-server; then
+
+              if (
+                cd /tmp/novnc-audio-server
+                npm install --no-audit --no-fund
+                npm run build
+              ); then
+
+                (
+                  cd /tmp/novnc-audio-server
+                  exec node dist/main.js \
+                    --host 127.0.0.1 \
+                    --port 6090 \
+                    --path /audio \
+                    --device android_sink \
+                    --sample-rate 48000 \
+                    --channels 2 \
+                    --bitrate 64000 \
+                    --latency 20000 \
+                    --codec opus
+                ) >/tmp/audio-server.log 2>&1 &
+                AUDIO_PID=$!
+
+                sleep 3
+
+                if kill -0 "$AUDIO_PID" 2>/dev/null; then
+                  echo "Audio server started."
+                  cat /tmp/audio-server.log
+                else
+                  echo "WARNING: Audio server exited during startup."
+                  cat /tmp/audio-server.log
+                  AUDIO_ENABLED=0
+                fi
+              else
+                echo "WARNING: Audio server build failed."
+                echo "Continuing with video-only mode."
+                AUDIO_ENABLED=0
+              fi
+            else
+              echo "WARNING: Could not download the audio server."
+              AUDIO_ENABLED=0
+            fi
+          fi
+
+          echo "STEP 8: Preparing the Android SDK..."
 
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
@@ -171,7 +285,6 @@ jobs:
 
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager was not found."
-            echo "ANDROID_HOME=$ANDROID_HOME"
             exit 1
           fi
 
@@ -186,8 +299,6 @@ jobs:
 
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
             --licenses >/dev/null 2>&1 || true
-
-          echo "Installing Android 4.4 system image..."
 
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
             "emulator" \
@@ -213,7 +324,6 @@ jobs:
             fi
           }
 
-          # Reduce display and rendering overhead.
           set_avd_property hw.lcd.width 360
           set_avd_property hw.lcd.height 640
           set_avd_property hw.lcd.density 160
@@ -222,7 +332,7 @@ jobs:
           set_avd_property vm.heapSize 128
           set_avd_property hw.keyboard yes
 
-          echo "STEP 7: Checking hardware acceleration..."
+          echo "STEP 9: Checking hardware acceleration..."
 
           if [ -e /dev/kvm ]; then
             sudo chmod a+rw /dev/kvm 2>/dev/null || true
@@ -233,25 +343,34 @@ jobs:
             echo "KVM is available."
           else
             ACCEL=off
-            export ANDROID_I_WANT_MY_TCG=yes
-            echo "WARNING: KVM unavailable; software CPU emulation will be slow."
+            echo "WARNING: KVM is unavailable; emulation may be slow."
           fi
 
           adb start-server
 
-          echo "STEP 8: Launching Android 4.4..."
+          echo "STEP 10: Launching Android 4.4..."
 
-          emulator -avd kitkat \
-            -port 5554 \
-            -accel "$ACCEL" \
-            -gpu swiftshader \
-            -no-snapshot \
-            -noaudio \
-            -no-boot-anim \
-            -verbose \
-            >/tmp/android-emulator.log 2>&1 &
+          if [ "$AUDIO_ENABLED" -eq 1 ]; then
+            QEMU_AUDIO_DRV=pa emulator -avd kitkat \
+              -port 5554 \
+              -accel "$ACCEL" \
+              -gpu swiftshader \
+              -no-snapshot \
+              -no-boot-anim \
+              -verbose \
+              >/tmp/android-emulator.log 2>&1 &
+          else
+            emulator -avd kitkat \
+              -port 5554 \
+              -accel "$ACCEL" \
+              -gpu swiftshader \
+              -no-snapshot \
+              -no-boot-anim \
+              -verbose \
+              >/tmp/android-emulator.log 2>&1 &
+          fi
+
           EMULATOR_PID=$!
-
           DEVICE_READY=0
 
           for i in $(seq 1 180); do
@@ -300,12 +419,12 @@ jobs:
           done
 
           if [ "$BOOTED" != "1" ]; then
-            echo "ERROR: Android did not finish booting."
+            echo "ERROR: Android failed to boot."
             tail -n 200 /tmp/android-emulator.log
             exit 1
           fi
 
-          echo "STEP 9: Installing APK files..."
+          echo "STEP 11: Installing APKs..."
 
           APK_DIR="$GITHUB_WORKSPACE/apks"
           APK_FILES=()
@@ -313,35 +432,23 @@ jobs:
           if [ -d "$APK_DIR" ]; then
             while IFS= read -r -d '' APK; do
               APK_FILES+=("$APK")
-            done < <(find "$APK_DIR" -maxdepth 1 \
-              -type f -iname '*.apk' -print0 | sort -z)
+            done < <(
+              find "$APK_DIR" -maxdepth 1 \
+                -type f -iname '*.apk' -print0 | sort -z
+            )
           fi
-
-          INSTALL_FAILURES=0
 
           if [ "${#APK_FILES[@]}" -eq 0 ]; then
             echo "No APK files found in the apks folder."
           else
-            echo "Found ${#APK_FILES[@]} APK file(s)."
-
             for APK in "${APK_FILES[@]}"; do
-              echo ""
-              echo "Installing: $(basename "$APK")"
-
-              if adb -s emulator-5554 install -r "$APK"; then
-                echo "Successfully installed: $(basename "$APK")"
-              else
-                echo "WARNING: Installation failed: $(basename "$APK")"
-                INSTALL_FAILURES=$((INSTALL_FAILURES + 1))
+              echo "Installing $(basename "$APK")..."
+              if ! adb -s emulator-5554 install -r "$APK"; then
+                echo "WARNING: Failed to install $(basename "$APK")."
               fi
             done
           fi
 
-          echo ""
-          echo "APK installation attempts finished."
-          echo "Failed APK installations: $INSTALL_FAILURES"
-
-          # Disable animations for a snappier UI.
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0
           adb shell settings put global animator_duration_scale 0
@@ -350,14 +457,24 @@ jobs:
           echo ""
           echo "ANDROID 4.4 IS READY."
           echo "Browser link: $BROWSER_URL"
-          echo "Keep this GitHub Actions workflow running."
+          echo "Audio enabled: $AUDIO_ENABLED"
+          echo "Click the noVNC page once to allow browser audio playback."
+          echo "Keep this workflow running."
 
           while kill -0 "$EMULATOR_PID" 2>/dev/null \
             && kill -0 "$TUNNEL_PID" 2>/dev/null; do
+
+            if [ "$AUDIO_ENABLED" -eq 1 ] \
+              && [ -n "$AUDIO_PID" ] \
+              && ! kill -0 "$AUDIO_PID" 2>/dev/null; then
+              echo "WARNING: Audio server stopped."
+              cat /tmp/audio-server.log
+              AUDIO_ENABLED=0
+            fi
+
             sleep 30
           done
 
-          echo "ERROR: Emulator or Cloudflare Tunnel stopped."
+          echo "ERROR: Emulator or tunnel stopped."
           tail -n 100 /tmp/android-emulator.log
           cat /tmp/cloudflared.log
-          exit 1
