@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Start Android 4.4 and browser tunnel
+      - name: Start optimized Android 4.4 session
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -22,13 +22,13 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
 
           if [ -z "${VNC_PASSWORD:-}" ] || [ "${#VNC_PASSWORD}" -ne 8 ]; then
-            echo "ERROR: Set repository secret VNC_PASSWORD to exactly 8 characters."
+            echo "Set VNC_PASSWORD to an 8-character repository secret."
             exit 1
           fi
 
           echo "::add-mask::$VNC_PASSWORD"
 
-          echo "Installing desktop and emulator dependencies..."
+          echo "Installing desktop dependencies..."
 
           sudo apt-get update
           sudo apt-get install -y \
@@ -38,38 +38,116 @@ jobs:
             libxcursor1 libxcomposite1 libxdamage1 libxfixes3 \
             libxkbcommon0 libxkbcommon-x11-0 libxcb-xinerama0
 
-          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          export ANDROID_SDK_ROOT="$ANDROID_HOME"
-          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export DISPLAY=:0
 
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # Smaller virtual desktop means fewer pixels to transmit.
+          Xvfb :0 -screen 0 800x900x24 \
+            -ac -nolisten tcp +extension GLX +render -noreset \
+            >/tmp/xvfb.log 2>&1 &
+          XVFB_PID=$!
 
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-              -type f -name sdkmanager 2>/dev/null \
-              | sort -V | tail -n 1 || true)"
+          sleep 2
+
+          if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+            cat /tmp/xvfb.log
+            exit 1
           fi
 
+          openbox >/tmp/openbox.log 2>&1 &
+
+          x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass \
+            >/dev/null
+          chmod 600 /tmp/vnc.pass
+
+          # More frequent screen updates for interactive use.
+          x11vnc -display :0 -forever -shared \
+            -localhost -rfbport 5900 -rfbauth /tmp/vnc.pass \
+            -wait 10 -defer 10 -wait_ui 2 \
+            >/tmp/x11vnc.log 2>&1 &
+
+          websockify --web=/usr/share/novnc \
+            127.0.0.1:6080 127.0.0.1:5900 \
+            >/tmp/novnc.log 2>&1 &
+
+          echo "Installing Cloudflare Tunnel..."
+
+          curl -fL --retry 3 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+            -o /tmp/cloudflared.deb
+
+          sudo dpkg -i /tmp/cloudflared.deb
+
+          cloudflared tunnel \
+            --url http://127.0.0.1:6080 \
+            --no-autoupdate \
+            >/tmp/cloudflared.log 2>&1 &
+          CLOUDFLARED_PID=$!
+
+          URL=""
+
+          for i in $(seq 1 90); do
+            URL="$(grep -Eo \
+              'https://[[:alnum:]-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log | head -n 1 || true)"
+
+            if [ -n "$URL" ]; then
+              break
+            fi
+
+            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Could not create the Cloudflare URL."
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          BROWSER_URL="${URL}/vnc.html#autoconnect=1&resize=scale&quality=5&compression=1"
+
+          echo ""
+          echo "============================================"
+          echo "ANDROID 4.4 BROWSER LINK:"
+          echo "$BROWSER_URL"
+          echo "============================================"
+          echo ""
+
+          echo "::notice title=Android Browser Link::$BROWSER_URL"
+
+          {
+            echo "## Android 4.4 Browser Emulator"
+            echo ""
+            echo "Browser link: $BROWSER_URL"
+            echo ""
+            echo "The Android emulator is starting. Keep this job running."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Locate Android SDK tools.
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null \
+            | sort -V | tail -n 1 || true)"
+
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager was not found."
-            echo "Android SDK path: $ANDROID_HOME"
+            echo "Android SDK command-line tools not found."
             exit 1
           fi
 
           AVDMANAGER="$(dirname "$SDKMANAGER")/avdmanager"
 
-          if [ ! -x "$AVDMANAGER" ]; then
-            echo "ERROR: avdmanager was not found."
-            exit 1
-          fi
-
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$(dirname "$SDKMANAGER"):$PATH"
 
-          echo "Accepting Android SDK licenses..."
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
             --licenses >/dev/null 2>&1 || true
 
-          echo "Installing Android 4.4 emulator image..."
+          echo "Installing Android 4.4 system image..."
 
           "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
             "emulator" \
@@ -95,101 +173,56 @@ jobs:
             fi
           }
 
-          set_avd_property hw.keyboard yes
-          set_avd_property hw.lcd.width 480
-          set_avd_property hw.lcd.height 800
-          set_avd_property hw.lcd.density 240
+          # Lower resolution: faster rendering and less VNC traffic.
+          set_avd_property hw.lcd.width 360
+          set_avd_property hw.lcd.height 640
+          set_avd_property hw.lcd.density 160
+          set_avd_property hw.cpu.ncore 2
+          set_avd_property hw.ramSize 1024
+          set_avd_property vm.heapSize 128
 
-          echo "Starting virtual desktop..."
-
-          export DISPLAY=:0
-
-          Xvfb :0 -screen 0 1280x800x24 \
-            -ac -nolisten tcp +extension GLX +render -noreset \
-            >/tmp/xvfb.log 2>&1 &
-          XVFB_PID=$!
-
-          sleep 2
-
-          if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-            cat /tmp/xvfb.log
-            echo "ERROR: Virtual display failed to start."
-            exit 1
-          fi
-
-          openbox >/tmp/openbox.log 2>&1 &
-          OPENBOX_PID=$!
-
-          x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass \
-            >/dev/null
-          chmod 600 /tmp/vnc.pass
-
-          x11vnc -display :0 -forever -shared \
-            -localhost -rfbport 5900 -rfbauth /tmp/vnc.pass \
-            >/tmp/x11vnc.log 2>&1 &
-          VNC_PID=$!
-
-          websockify --web=/usr/share/novnc \
-            127.0.0.1:6080 127.0.0.1:5900 \
-            >/tmp/novnc.log 2>&1 &
-          WEBSOCKIFY_PID=$!
-
-          sleep 2
-
-          for PID in "$OPENBOX_PID" "$VNC_PID" "$WEBSOCKIFY_PID"; do
-            if ! kill -0 "$PID" 2>/dev/null; then
-              echo "ERROR: A desktop service exited."
-              cat /tmp/openbox.log /tmp/x11vnc.log /tmp/novnc.log
-              exit 1
-            fi
-          done
-
-          echo "Downloading Cloudflare Tunnel..."
-
-          curl -fL --retry 3 \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
-            -o /tmp/cloudflared.deb
-
-          sudo dpkg -i /tmp/cloudflared.deb
-
-          echo "Starting Android emulator..."
+          echo "Checking hardware virtualization..."
 
           if [ -e /dev/kvm ]; then
             sudo chmod a+rw /dev/kvm 2>/dev/null || true
           fi
 
+          "$ANDROID_HOME/emulator/emulator" -accel-check || true
+
           if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             ACCEL=on
+            echo "KVM available: hardware-accelerated CPU emulation."
           else
             ACCEL=off
-            echo "KVM unavailable; using slower software emulation."
+            export ANDROID_I_WANT_MY_TCG=yes
+            echo "WARNING: KVM unavailable; Android will run much slower."
           fi
 
           adb start-server
 
+          echo "Launching Android 4.4..."
+
           emulator -avd kitkat \
             -port 5554 \
             -accel "$ACCEL" \
-            -gpu swiftshader_indirect \
+            -gpu swiftshader \
             -no-snapshot \
             -noaudio \
             -no-boot-anim \
-            -verbose \
             >/tmp/android-emulator.log 2>&1 &
           EMULATOR_PID=$!
-
-          echo "Waiting for emulator to appear in ADB..."
 
           DEVICE_READY=0
 
           for i in $(seq 1 180); do
             if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "ERROR: Emulator process exited."
+              echo "Emulator exited unexpectedly."
               tail -n 200 /tmp/android-emulator.log
               exit 1
             fi
 
-            if adb devices | grep -qE '^emulator-5554[[:space:]]+device$'; then
+            if adb devices | grep -qE \
+              '^emulator-5554[[:space:]]+device$'; then
               DEVICE_READY=1
               break
             fi
@@ -198,64 +231,11 @@ jobs:
           done
 
           if [ "$DEVICE_READY" -ne 1 ]; then
-            echo "ERROR: Emulator did not connect to ADB."
+            echo "Emulator did not connect to ADB."
             adb devices -l || true
             tail -n 200 /tmp/android-emulator.log
             exit 1
           fi
-
-          echo "Starting Cloudflare Tunnel..."
-
-          cloudflared tunnel \
-            --url http://127.0.0.1:6080 \
-            --no-autoupdate \
-            >/tmp/cloudflared.log 2>&1 &
-          CLOUDFLARED_PID=$!
-
-          URL=""
-
-          for i in $(seq 1 90); do
-            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
-              echo "ERROR: Cloudflare Tunnel exited."
-              cat /tmp/cloudflared.log
-              exit 1
-            fi
-
-            URL="$(grep -Eo \
-              'https://[[:alnum:]-]+\.trycloudflare\.com' \
-              /tmp/cloudflared.log | head -n 1 || true)"
-
-            if [ -n "$URL" ]; then
-              break
-            fi
-
-            sleep 2
-          done
-
-          if [ -z "$URL" ]; then
-            echo "ERROR: No Cloudflare URL was generated."
-            cat /tmp/cloudflared.log
-            exit 1
-          fi
-
-          BROWSER_URL="${URL}/vnc.html?autoconnect=1&resize=remote"
-
-          echo ""
-          echo "============================================"
-          echo "ANDROID 4.4 BROWSER LINK:"
-          echo "$BROWSER_URL"
-          echo "============================================"
-          echo ""
-
-          echo "::notice title=Android 4.4 Browser Link::$BROWSER_URL"
-
-          {
-            echo "## Android 4.4 Browser Emulator"
-            echo ""
-            echo "Browser link: $BROWSER_URL"
-            echo ""
-            echo "The link appears here in the logs while the session is running."
-          } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Waiting for Android to finish booting..."
 
@@ -263,7 +243,7 @@ jobs:
 
           for i in $(seq 1 180); do
             if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "ERROR: Emulator exited during boot."
+              echo "Emulator exited during boot."
               tail -n 200 /tmp/android-emulator.log
               exit 1
             fi
@@ -280,25 +260,26 @@ jobs:
           done
 
           if [ "$BOOTED" != "1" ]; then
-            echo "ERROR: Android did not finish booting."
-            adb devices -l || true
+            echo "Android failed to finish booting."
             tail -n 200 /tmp/android-emulator.log
             exit 1
           fi
 
-          adb shell settings put system screen_off_timeout 2147483647 || true
-          adb shell input keyevent 82 || true
+          # Remove transition animations to make the UI feel snappier.
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell settings put system screen_off_timeout 2147483647
 
-          echo "Android 4.4 has booted successfully."
-          echo "Open the browser link printed above."
-          echo "Keep this workflow running while you use Android."
+          echo "Android 4.4 is ready."
+          echo "Use the browser link printed above."
 
           while kill -0 "$EMULATOR_PID" 2>/dev/null \
             && kill -0 "$CLOUDFLARED_PID" 2>/dev/null; do
             sleep 30
           done
 
-          echo "ERROR: Emulator or tunnel stopped."
+          echo "The emulator or tunnel stopped."
           tail -n 100 /tmp/android-emulator.log
           cat /tmp/cloudflared.log
           exit 1
